@@ -1,0 +1,78 @@
+{
+  "name": "simple-chat-extension",
+  "displayName": "Simple Chat",
+  "description": "Simple OpenRouter chat with git diff support",
+  "version": "0.1.0",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": ["Other"],
+  "activationEvents": ["onStartupFinished"],
+  "main": "./out/extension.js",
+  "browser": "./out/extension.js",
+  "extensionKind": ["ui", "workspace"],
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "simpleChat",
+          "title": "Simple Chat",
+          "icon": "$(comment-discussion)"
+        }
+      ]
+    },
+    "views": {
+      "simpleChat": [
+        {
+          "id": "simpleChatView",
+          "name": "Conversations"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "simpleChat.openChat",
+        "title": "Open Chat",
+        "category": "Simple Chat",
+        "icon": "$(add)"
+      },
+      {
+        "command": "simpleChat.configure",
+        "title": "Configure OpenRouter",
+        "category": "Simple Chat"
+      },
+      {
+        "command": "simpleChat.selectFiles",
+        "title": "Select Files for Context",
+        "category": "Simple Chat"
+      },
+      {
+        "command": "simpleChat.clearFiles",
+        "title": "Clear File Context",
+        "category": "Simple Chat"
+      }
+    ],
+    "menus": {
+      "view/title": [
+        {
+          "command": "simpleChat.openChat",
+          "when": "view == simpleChatView",
+          "group": "navigation"
+        }
+      ]
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./"
+  },
+  "devDependencies": {
+    "@types/node": "^18.0.0",
+    "@types/vscode": "^1.85.0",
+    "typescript": "^5.3.0"
+  },
+  "dependencies": {
+    "axios": "^1.7.2"
+  }
+}
