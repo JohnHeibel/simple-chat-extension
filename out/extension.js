@@ -265,11 +265,11 @@ async function handleSendMessage(userMessage, context, panel) {
                         properties: {
                             file_path: {
                                 type: 'string',
-                                description: 'The full absolute path to the file to edit'
+                                description: 'The full absolute path to the file to edit (e.g., /Users/name/project/file.py)'
                             },
                             diff: {
                                 type: 'string',
-                                description: 'The unified diff format patch to apply to the file. Must include --- a/path and +++ b/path headers, @@ hunk headers, and lines prefixed with +, -, or space.'
+                                description: 'A unified diff format patch. Must start with --- and +++ headers showing the absolute file path, followed by @@ hunk headers and the changes.'
                             },
                             description: {
                                 type: 'string',
@@ -330,6 +330,15 @@ async function handleSendMessage(userMessage, context, panel) {
                                     }
                                     else {
                                         // Append to existing tool call
+                                        if (toolCallDelta.id) {
+                                            toolCalls[toolCallDelta.index].id = toolCallDelta.id;
+                                        }
+                                        if (toolCallDelta.type) {
+                                            toolCalls[toolCallDelta.index].type = toolCallDelta.type;
+                                        }
+                                        if (toolCallDelta.function?.name) {
+                                            toolCalls[toolCallDelta.index].function.name += toolCallDelta.function.name;
+                                        }
                                         if (toolCallDelta.function?.arguments) {
                                             toolCalls[toolCallDelta.index].function.arguments += toolCallDelta.function.arguments;
                                         }
@@ -346,6 +355,8 @@ async function handleSendMessage(userMessage, context, panel) {
         });
         await new Promise((resolve, reject) => {
             response.data.on('end', () => {
+                console.log('Stream ended. Tool calls count:', toolCalls.length);
+                console.log('Tool calls:', JSON.stringify(toolCalls, null, 2));
                 // Build the assistant message for conversation history
                 const assistantHistoryMessage = {
                     role: 'assistant',
@@ -358,14 +369,38 @@ async function handleSendMessage(userMessage, context, panel) {
                 panel.webview.postMessage({ command: 'endStreaming' });
                 // If there are tool calls, show them for approval
                 if (toolCalls.length > 0) {
+                    // Show visual indicator that tool calls are being prepared
+                    panel.webview.postMessage({
+                        command: 'addMessage',
+                        role: 'system',
+                        content: '🔧 Preparing file edit...',
+                    });
                     for (const toolCall of toolCalls) {
-                        const args = JSON.parse(toolCall.function.arguments);
-                        panel.webview.postMessage({
-                            command: 'showToolCall',
-                            toolCallId: toolCall.id,
-                            toolName: toolCall.function.name,
-                            args: args,
-                        });
+                        try {
+                            console.log('Parsing tool call arguments:', toolCall.function.arguments);
+                            // Try to repair common JSON issues
+                            let argsString = toolCall.function.arguments;
+                            // Fix missing colon and quote after keys: "key value" => "key":"value"
+                            // This handles cases like "diff--- => "diff":"---
+                            argsString = argsString.replace(/"(\w+)"(?!:)(\S)/g, '"$1":"$2');
+                            console.log('Repaired arguments:', argsString);
+                            const args = JSON.parse(argsString);
+                            panel.webview.postMessage({
+                                command: 'showToolCall',
+                                toolCallId: toolCall.id,
+                                toolName: toolCall.function.name,
+                                args: args,
+                            });
+                        }
+                        catch (parseError) {
+                            console.error('Failed to parse tool call arguments:', parseError.message);
+                            console.error('Arguments string:', toolCall.function.arguments);
+                            panel.webview.postMessage({
+                                command: 'addMessage',
+                                role: 'error',
+                                content: `Failed to parse tool call: ${parseError.message}`,
+                            });
+                        }
                     }
                 }
                 resolve();
@@ -395,7 +430,12 @@ async function handleApplyDiff(diffContent) {
                 currentFile = line.substring(6);
                 filePatches.set(currentFile, []);
             }
-            else if (line.startsWith('+++ b/')) {
+            else if (line.startsWith('--- ')) {
+                // Handle diffs without a/ prefix
+                currentFile = line.substring(4);
+                filePatches.set(currentFile, []);
+            }
+            else if (line.startsWith('+++ b/') || line.startsWith('+++ ')) {
                 continue;
             }
             else if (currentFile && (line.startsWith('@@') || line.startsWith('+') || line.startsWith('-') || line.startsWith(' '))) {
@@ -408,7 +448,18 @@ async function handleApplyDiff(diffContent) {
             return;
         }
         for (const [filePath, patchLines] of filePatches) {
-            const fileUri = vscode.Uri.joinPath(workspaceFolder.uri, filePath);
+            // Check if path is absolute or relative
+            let normalizedPath = filePath;
+            // Handle missing leading slash (e.g., "Users/..." should be "/Users/...")
+            if (!normalizedPath.startsWith('/') && !normalizedPath.startsWith('.') &&
+                (normalizedPath.startsWith('Users/') || normalizedPath.startsWith('home/') ||
+                    normalizedPath.includes(':/') || /^[A-Za-z]:[\\/]/.test(normalizedPath))) {
+                normalizedPath = '/' + normalizedPath;
+            }
+            const isAbsolute = normalizedPath.startsWith('/') || /^[A-Za-z]:[\\/]/.test(normalizedPath);
+            const fileUri = isAbsolute
+                ? vscode.Uri.file(normalizedPath)
+                : vscode.Uri.joinPath(workspaceFolder.uri, normalizedPath);
             try {
                 const content = await vscode.workspace.fs.readFile(fileUri);
                 const originalLines = Buffer.from(content).toString('utf8').split('\n');
@@ -444,10 +495,10 @@ async function handleApplyDiff(diffContent) {
                     originalIndex++;
                 }
                 await vscode.workspace.fs.writeFile(fileUri, Buffer.from(newLines.join('\n'), 'utf8'));
-                vscode.window.showInformationMessage(`Applied changes to ${filePath}`);
+                vscode.window.showInformationMessage(`Applied changes to ${normalizedPath}`);
             }
             catch (error) {
-                vscode.window.showErrorMessage(`Failed to apply changes to ${filePath}: ${error.message}`);
+                vscode.window.showErrorMessage(`Failed to apply changes to ${normalizedPath}: ${error.message}`);
             }
         }
     }
@@ -460,76 +511,22 @@ async function handleApproveToolCall(toolCallId, toolName, args, context, panel)
         if (toolName === 'edit_file') {
             // Apply the diff
             await handleApplyDiff(args.diff);
-            // Add tool response to conversation history
+            // Add tool response to conversation history with tool_call_id
             conversationHistory.push({
                 role: 'tool',
+                tool_call_id: toolCallId,
                 content: JSON.stringify({ success: true, message: 'Changes applied successfully' }),
             });
-            // Continue the conversation with the tool result
-            let config = context.globalState.get('config');
-            if (!config) {
-                config = {
-                    apiKey: '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',
-                    model: 'anthropic/claude-sonnet-4.5',
-                    baseUrl: 'https://openrouter.ai/api/v1',
-                };
-            }
-            const systemPrompt = await return_system_prompt();
-            const messages = [
-                { role: 'system', content: systemPrompt },
-                ...conversationHistory
-            ];
-            const tools = [
-                {
-                    type: 'function',
-                    function: {
-                        name: 'edit_file',
-                        description: 'Edit a file by providing a unified diff format patch. The diff will be shown to the user for approval before being applied.',
-                        parameters: {
-                            type: 'object',
-                            properties: {
-                                file_path: {
-                                    type: 'string',
-                                    description: 'The full absolute path to the file to edit'
-                                },
-                                diff: {
-                                    type: 'string',
-                                    description: 'The unified diff format patch to apply to the file. Must include --- a/path and +++ b/path headers, @@ hunk headers, and lines prefixed with +, -, or space.'
-                                },
-                                description: {
-                                    type: 'string',
-                                    description: 'A brief description of what changes this diff makes'
-                                }
-                            },
-                            required: ['file_path', 'diff', 'description']
-                        }
-                    }
-                }
-            ];
-            // Make a follow-up request to let the model respond
-            const response = await axios_1.default.post(`${config.baseUrl}/chat/completions`, {
-                model: config.model,
-                messages: messages,
-                tools: tools,
-            }, {
-                headers: {
-                    'Authorization': `Bearer ${config.apiKey}`,
-                    'Content-Type': 'application/json',
-                },
-            });
-            const assistantMessage = response.data.choices[0].message.content;
-            conversationHistory.push({
-                role: 'assistant',
-                content: assistantMessage,
-            });
+            // Show success message in chat
             panel.webview.postMessage({
                 command: 'addMessage',
-                role: 'assistant',
-                content: assistantMessage,
+                role: 'system',
+                content: '✓ Changes applied successfully',
             });
         }
     }
     catch (error) {
+        console.error('Failed to apply tool call:', error);
         vscode.window.showErrorMessage(`Failed to apply tool call: ${error.message}`);
         panel.webview.postMessage({
             command: 'addMessage',
@@ -539,15 +536,16 @@ async function handleApproveToolCall(toolCallId, toolName, args, context, panel)
     }
 }
 async function handleRejectToolCall(toolCallId, panel) {
-    // Add rejection to conversation history
+    // Add rejection to conversation history with tool_call_id
     conversationHistory.push({
         role: 'tool',
+        tool_call_id: toolCallId,
         content: JSON.stringify({ success: false, message: 'User rejected the proposed changes' }),
     });
     panel.webview.postMessage({
         command: 'addMessage',
-        role: 'assistant',
-        content: 'Understood. The proposed changes have been rejected. Let me know if you\'d like me to suggest different changes.',
+        role: 'system',
+        content: '✗ Changes rejected',
     });
 }
 function getWebviewContent() {
