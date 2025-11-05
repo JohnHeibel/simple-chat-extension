@@ -6,11 +6,18 @@
   "engines": {
     "vscode": "^1.85.0"
   },
-  "categories": ["Other"],
-  "activationEvents": ["onStartupFinished"],
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
   "main": "./out/extension.js",
   "browser": "./out/extension.js",
-  "extensionKind": ["ui", "workspace"],
+  "extensionKind": [
+    "ui",
+    "workspace"
+  ],
   "contributes": {
     "viewsContainers": {
       "activitybar": [
@@ -65,7 +72,11 @@
   "scripts": {
     "vscode:prepublish": "npm run compile",
     "compile": "tsc -p ./",
-    "watch": "tsc -watch -p ./"
+    "watch": "tsc -watch -p ./",
+    "test": "npm run compile && node out/patchApplier.test.js",
+    "test:integration": "npm run compile && node out/integration.test.js",
+    "test:large": "npm run compile && node out/largeIntegration.test.js",
+    "test:all": "npm run compile && node out/patchApplier.test.js && node out/integration.test.js && node out/largeIntegration.test.js"
   },
   "devDependencies": {
     "@types/node": "^18.0.0",

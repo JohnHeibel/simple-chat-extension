@@ -42,6 +42,7 @@ exports.activate = activate;
 exports.deactivate = deactivate;
 const vscode = __importStar(require("vscode"));
 const axios_1 = __importDefault(require("axios"));
+const patchApplier_1 = require("./patchApplier");
 let chatPanel;
 let conversationHistory = [];
 let selectedFiles = [];
@@ -269,7 +270,7 @@ async function handleSendMessage(userMessage, context, panel) {
                             },
                             diff: {
                                 type: 'string',
-                                description: 'A unified diff format patch. Must start with --- and +++ headers showing the absolute file path, followed by @@ hunk headers and the changes.'
+                                description: 'A unified diff format patch showing the changes. Format: "--- /absolute/path\\n+++ /absolute/path\\n@@ -start,count +start,count @@\\n context\\n-removed\\n+added". Include context lines (prefixed with space) around changes for reliable matching.'
                             },
                             description: {
                                 type: 'string',
@@ -420,90 +421,60 @@ async function handleSendMessage(userMessage, context, panel) {
     }
 }
 async function handleApplyDiff(diffContent) {
-    try {
-        // Simple diff parser - looks for standard unified diff format
-        const lines = diffContent.split('\n');
-        let currentFile = '';
-        const filePatches = new Map();
-        for (const line of lines) {
-            if (line.startsWith('--- a/')) {
-                currentFile = line.substring(6);
-                filePatches.set(currentFile, []);
-            }
-            else if (line.startsWith('--- ')) {
-                // Handle diffs without a/ prefix
-                currentFile = line.substring(4);
-                filePatches.set(currentFile, []);
-            }
-            else if (line.startsWith('+++ b/') || line.startsWith('+++ ')) {
-                continue;
-            }
-            else if (currentFile && (line.startsWith('@@') || line.startsWith('+') || line.startsWith('-') || line.startsWith(' '))) {
-                filePatches.get(currentFile)?.push(line);
-            }
-        }
-        const workspaceFolder = vscode.workspace.workspaceFolders?.[0];
-        if (!workspaceFolder) {
-            vscode.window.showErrorMessage('No workspace folder open');
-            return;
-        }
-        for (const [filePath, patchLines] of filePatches) {
-            // Check if path is absolute or relative
-            let normalizedPath = filePath;
-            // Handle missing leading slash (e.g., "Users/..." should be "/Users/...")
-            if (!normalizedPath.startsWith('/') && !normalizedPath.startsWith('.') &&
-                (normalizedPath.startsWith('Users/') || normalizedPath.startsWith('home/') ||
-                    normalizedPath.includes(':/') || /^[A-Za-z]:[\\/]/.test(normalizedPath))) {
-                normalizedPath = '/' + normalizedPath;
-            }
-            const isAbsolute = normalizedPath.startsWith('/') || /^[A-Za-z]:[\\/]/.test(normalizedPath);
-            const fileUri = isAbsolute
-                ? vscode.Uri.file(normalizedPath)
-                : vscode.Uri.joinPath(workspaceFolder.uri, normalizedPath);
-            try {
-                const content = await vscode.workspace.fs.readFile(fileUri);
-                const originalLines = Buffer.from(content).toString('utf8').split('\n');
-                const newLines = [];
-                let originalIndex = 0;
-                for (const patchLine of patchLines) {
-                    if (patchLine.startsWith('@@')) {
-                        const match = patchLine.match(/@@ -(\d+)/);
-                        if (match) {
-                            originalIndex = parseInt(match[1]) - 1;
-                            // Copy lines up to this point
-                            while (newLines.length < originalIndex && originalIndex < originalLines.length) {
-                                newLines.push(originalLines[newLines.length]);
-                            }
-                        }
-                    }
-                    else if (patchLine.startsWith('+')) {
-                        newLines.push(patchLine.substring(1));
-                    }
-                    else if (patchLine.startsWith('-')) {
-                        originalIndex++;
-                    }
-                    else if (patchLine.startsWith(' ')) {
-                        if (originalIndex < originalLines.length) {
-                            newLines.push(originalLines[originalIndex]);
-                            originalIndex++;
-                        }
-                    }
-                }
-                // Copy remaining lines
-                while (originalIndex < originalLines.length) {
-                    newLines.push(originalLines[originalIndex]);
-                    originalIndex++;
-                }
-                await vscode.workspace.fs.writeFile(fileUri, Buffer.from(newLines.join('\n'), 'utf8'));
-                vscode.window.showInformationMessage(`Applied changes to ${normalizedPath}`);
-            }
-            catch (error) {
-                vscode.window.showErrorMessage(`Failed to apply changes to ${normalizedPath}: ${error.message}`);
-            }
+    // Extract file path from diff headers
+    const lines = diffContent.split('\n');
+    let filePath = '';
+    for (const line of lines) {
+        if (line.startsWith('--- ')) {
+            filePath = line.substring(4).replace(/^a\//, '').replace(/^b\//, '');
+            break;
         }
     }
+    if (!filePath) {
+        throw new Error('Could not determine file path from diff');
+    }
+    // Normalize path
+    let normalizedPath = filePath;
+    // Handle missing leading slash (e.g., "Users/..." should be "/Users/...")
+    if (!normalizedPath.startsWith('/') && !normalizedPath.startsWith('.') &&
+        (normalizedPath.startsWith('Users/') || normalizedPath.startsWith('home/') ||
+            normalizedPath.includes(':/') || /^[A-Za-z]:[\\/]/.test(normalizedPath))) {
+        normalizedPath = '/' + normalizedPath;
+    }
+    // Determine if path is absolute
+    const isAbsolute = normalizedPath.startsWith('/') || /^[A-Za-z]:[\\/]/.test(normalizedPath);
+    let fileUri;
+    if (isAbsolute) {
+        fileUri = vscode.Uri.file(normalizedPath);
+    }
+    else {
+        const workspaceFolder = vscode.workspace.workspaceFolders?.[0];
+        if (!workspaceFolder) {
+            throw new Error('No workspace folder open');
+        }
+        fileUri = vscode.Uri.joinPath(workspaceFolder.uri, normalizedPath);
+    }
+    // Read original content
+    let originalContent;
+    try {
+        const content = await vscode.workspace.fs.readFile(fileUri);
+        originalContent = Buffer.from(content).toString('utf8');
+    }
     catch (error) {
-        vscode.window.showErrorMessage(`Failed to apply diff: ${error.message}`);
+        throw new Error(`Failed to read file ${normalizedPath}: ${error.message}`);
+    }
+    // Apply patch using the reliable patch applier
+    const result = (0, patchApplier_1.applyPatch)(originalContent, diffContent);
+    if (!result.success) {
+        throw new Error(result.error || 'Failed to apply patch');
+    }
+    // Write new content
+    try {
+        await vscode.workspace.fs.writeFile(fileUri, Buffer.from(result.newContent, 'utf8'));
+        vscode.window.showInformationMessage(`Applied changes to ${normalizedPath}`);
+    }
+    catch (error) {
+        throw new Error(`Failed to write file ${normalizedPath}: ${error.message}`);
     }
 }
 async function handleApproveToolCall(toolCallId, toolName, args, context, panel) {
