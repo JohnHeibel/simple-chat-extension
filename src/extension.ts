@@ -1,9 +1,13 @@
 // Simple Chat Extension - VS Code chat interface with AI assistance and code diff application
 // Integrates with OpenRouter API for streaming chat responses
+// Modified for automated human trial platform — fetches prompts from backend, logs all messages
 
 import * as vscode from 'vscode';
+import * as fs from 'fs';
+import * as path from 'path';
 import axios from 'axios';
 import { applyPatch } from './patchApplier';
+import { TaskPanelProvider } from './TaskPanelProvider';
 
 interface Config {
   apiKey: string;
@@ -16,17 +20,99 @@ interface Message {
   content: string;
 }
 
+interface TrialConfig {
+  participant_id: string;
+  scenario_id: number;
+  module_filename: string;
+  task_dir: string;
+  title: string;
+}
+
 let chatPanel: vscode.WebviewPanel | undefined;
 let conversationHistory: Message[] = [];
 let selectedFiles: string[] = [];
+let cachedTrialConfig: TrialConfig | null = null;
+
+/**
+ * Read the trial config file written by the backend.
+ */
+function readTrialConfig(): TrialConfig | null {
+  try {
+    const workspaceFolders = vscode.workspace.workspaceFolders;
+    if (!workspaceFolders || workspaceFolders.length === 0) {
+      return null;
+    }
+    const configPath = path.join(workspaceFolders[0].uri.fsPath, '.trial_config.json');
+    if (!fs.existsSync(configPath)) {
+      return null;
+    }
+    const data = fs.readFileSync(configPath, 'utf-8');
+    cachedTrialConfig = JSON.parse(data);
+    return cachedTrialConfig;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Get the backend URL from VS Code settings.
+ */
+function getBackendUrl(): string {
+  const config = vscode.workspace.getConfiguration('simple-chat');
+  return config.get<string>('backendUrl') || 'https://code.johnheibel.com';
+}
+
+/**
+ * Log a chat message to the backend (fire-and-forget).
+ */
+async function logChatMessage(
+  participantId: string,
+  role: string,
+  content: string,
+  toolCallData?: any,
+): Promise<void> {
+  const backendUrl = getBackendUrl();
+  await axios.post(`${backendUrl}/api/log/chat-message/${participantId}`, {
+    role,
+    content,
+    tool_call_data: toolCallData ? JSON.stringify(toolCallData) : null,
+  }).catch(() => {}); // fire-and-forget
+}
+
+/**
+ * Log an event to the backend (fire-and-forget).
+ */
+async function logEvent(
+  participantId: string,
+  eventType: string,
+  eventData?: any,
+): Promise<void> {
+  const backendUrl = getBackendUrl();
+  await axios.post(`${backendUrl}/api/log/event/${participantId}`, {
+    event_type: eventType,
+    event_data: eventData ? JSON.stringify(eventData) : null,
+  }).catch(() => {});
+}
 
 /**
  * Returns the system prompt for the AI assistant.
- * Fetches from a network source (Pastebin).
+ * Fetches from the trial backend based on participant's current (condition, scenario).
  */
 async function return_system_prompt(): Promise<string> {
-  const response = await axios.get('https://pastebin.com/raw/s4db5X5V');
-  return response.data;
+  try {
+    const trialConfig = readTrialConfig();
+    if (!trialConfig?.participant_id) {
+      return 'You are a helpful coding assistant.';
+    }
+    const backendUrl = getBackendUrl();
+    const response = await axios.get(
+      `${backendUrl}/api/prompts/${trialConfig.participant_id}`
+    );
+    return response.data.prompt;
+  } catch (error) {
+    console.error('Failed to fetch prompt from backend:', error);
+    return 'You are a helpful coding assistant.';
+  }
 }
 
 class ChatViewProvider implements vscode.TreeDataProvider<vscode.TreeItem> {
@@ -58,6 +144,21 @@ export function activate(context: vscode.ExtensionContext) {
   // Register tree view provider
   const chatViewProvider = new ChatViewProvider();
   vscode.window.registerTreeDataProvider('simpleChatView', chatViewProvider);
+
+  // Register task panel provider
+  const taskPanelProvider = new TaskPanelProvider(context.extensionUri);
+  context.subscriptions.push(
+    vscode.window.registerWebviewViewProvider(TaskPanelProvider.viewType, taskPanelProvider)
+  );
+
+  // When task changes, clear chat history
+  taskPanelProvider.onTaskChanged(() => {
+    conversationHistory = [];
+    if (chatPanel) {
+      chatPanel.webview.postMessage({ command: 'clearChat' });
+    }
+  });
+
   // Register configure command
   const configureCommand = vscode.commands.registerCommand(
     'simpleChat.configure',
@@ -248,13 +349,23 @@ async function handleSendMessage(
   try {
     let config = context.globalState.get<Config>('config');
 
-    // Use hardcoded defaults if not configured
+    // Use settings-based defaults if not configured via command
     if (!config) {
+      const settings = vscode.workspace.getConfiguration('simple-chat');
       config = {
-        apiKey: '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',
-        model: 'anthropic/claude-sonnet-4.5',
-        baseUrl: 'https://openrouter.ai/api/v1',
+        apiKey: settings.get<string>('apiKey') || '',
+        model: settings.get<string>('model') || 'anthropic/claude-sonnet-4.5',
+        baseUrl: settings.get<string>('baseUrl') || 'https://openrouter.ai/api/v1',
       };
+    }
+
+    if (!config.apiKey) {
+      panel.webview.postMessage({
+        command: 'addMessage',
+        role: 'error',
+        content: 'No API key configured. Please configure via settings or the Configure command.',
+      });
+      return;
     }
 
     // Build context from selected files
@@ -280,6 +391,12 @@ async function handleSendMessage(
       role: 'user',
       content: contextMessage,
     });
+
+    // Log user message to backend
+    const trialConfig = readTrialConfig();
+    if (trialConfig?.participant_id) {
+      logChatMessage(trialConfig.participant_id, 'user', contextMessage);
+    }
 
     panel.webview.postMessage({
       command: 'addMessage',
@@ -422,6 +539,17 @@ async function handleSendMessage(
         }
 
         conversationHistory.push(assistantHistoryMessage);
+
+        // Log assistant message to backend
+        const tc = readTrialConfig();
+        if (tc?.participant_id) {
+          logChatMessage(
+            tc.participant_id,
+            'assistant',
+            assistantMessage || '',
+            toolCalls.length > 0 ? toolCalls : undefined,
+          );
+        }
 
         panel.webview.postMessage({ command: 'endStreaming' });
 
@@ -569,6 +697,17 @@ async function handleApproveToolCall(
         content: JSON.stringify({ success: true, message: 'Changes applied successfully' }),
       } as any);
 
+      // Log tool approval to backend
+      const tcApprove = readTrialConfig();
+      if (tcApprove?.participant_id) {
+        logChatMessage(tcApprove.participant_id, 'tool_result', JSON.stringify({
+          action: 'approved',
+          tool_call_id: toolCallId,
+          tool_name: toolName,
+          args: args,
+        }));
+      }
+
       // Show success message in chat
       panel.webview.postMessage({
         command: 'addMessage',
@@ -597,6 +736,15 @@ async function handleRejectToolCall(
     tool_call_id: toolCallId,
     content: JSON.stringify({ success: false, message: 'User rejected the proposed changes' }),
   } as any);
+
+  // Log tool rejection to backend
+  const tcReject = readTrialConfig();
+  if (tcReject?.participant_id) {
+    logChatMessage(tcReject.participant_id, 'tool_result', JSON.stringify({
+      action: 'rejected',
+      tool_call_id: toolCallId,
+    }));
+  }
 
   panel.webview.postMessage({
     command: 'addMessage',

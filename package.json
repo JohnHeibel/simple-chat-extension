@@ -33,6 +33,11 @@
         {
           "id": "simpleChatView",
           "name": "Conversations"
+        },
+        {
+          "type": "webview",
+          "id": "trialTaskView",
+          "name": "Current Task"
         }
       ]
     },
@@ -59,6 +64,32 @@
         "category": "Simple Chat"
       }
     ],
+    "configuration": {
+      "type": "object",
+      "title": "Simple Chat",
+      "properties": {
+        "simple-chat.backendUrl": {
+          "type": "string",
+          "default": "https://code.johnheibel.com",
+          "description": "URL of the trial backend API"
+        },
+        "simple-chat.apiKey": {
+          "type": "string",
+          "default": "",
+          "description": "OpenRouter API key"
+        },
+        "simple-chat.model": {
+          "type": "string",
+          "default": "anthropic/claude-sonnet-4.5",
+          "description": "Model to use for chat completions"
+        },
+        "simple-chat.baseUrl": {
+          "type": "string",
+          "default": "https://openrouter.ai/api/v1",
+          "description": "API base URL"
+        }
+      }
+    },
     "menus": {
       "view/title": [
         {
