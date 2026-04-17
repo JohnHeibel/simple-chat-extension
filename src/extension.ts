@@ -339,6 +339,8 @@ export function activate(context: vscode.ExtensionContext) {
     clearFilesCommand,
     openChatCommand
   );
+
+  vscode.commands.executeCommand('simpleChat.openChat');
 }
 
 async function handleSendMessage(
