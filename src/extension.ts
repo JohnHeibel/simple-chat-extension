@@ -16,8 +16,10 @@ interface Config {
 }
 
 interface Message {
-  role: 'user' | 'assistant' | 'system';
-  content: string;
+  role: 'user' | 'assistant' | 'system' | 'tool';
+  content: string | null;
+  tool_call_id?: string;
+  tool_calls?: any[];
 }
 
 interface TrialConfig {
@@ -32,6 +34,67 @@ let chatPanel: vscode.WebviewPanel | undefined;
 let conversationHistory: Message[] = [];
 let selectedFiles: string[] = [];
 let cachedTrialConfig: TrialConfig | null = null;
+
+type ChatState = 'idle' | 'streaming' | 'awaitingTool' | 'applyingTool';
+
+interface PendingToolCall {
+  id: string;
+  name: string;
+  args: any;
+  status: 'pending' | 'applied' | 'rejected' | 'failed';
+}
+
+let chatState: ChatState = 'idle';
+let pendingToolCalls = new Map<string, PendingToolCall>();
+
+function hasPendingToolCalls(): boolean {
+  for (const call of pendingToolCalls.values()) {
+    if (call.status === 'pending') {
+      return true;
+    }
+  }
+  return false;
+}
+
+function setChatState(state: ChatState, panel?: vscode.WebviewPanel) {
+  chatState = state;
+  const isIdle = state === 'idle' && !hasPendingToolCalls();
+  const target = panel || chatPanel;
+  target?.webview.postMessage({
+    command: 'setInputEnabled',
+    enabled: isIdle,
+    reason: isIdle ? '' : 'Resolve the current assistant response before continuing.',
+  });
+}
+
+function resetPendingToolCalls(panel?: vscode.WebviewPanel) {
+  pendingToolCalls.clear();
+  setChatState('idle', panel);
+}
+
+function resolvePendingToolCall(toolCallId: string, status: PendingToolCall['status'], panel: vscode.WebviewPanel) {
+  const pending = pendingToolCalls.get(toolCallId);
+  if (pending) {
+    pending.status = status;
+  }
+
+  if (!hasPendingToolCalls()) {
+    setChatState('idle', panel);
+  } else {
+    setChatState('awaitingTool', panel);
+  }
+}
+
+function appendToolResult(
+  toolCallId: string,
+  result: { success: boolean; message: string; [key: string]: any },
+) {
+  conversationHistory.push({
+    role: 'tool',
+    tool_call_id: toolCallId,
+    content: JSON.stringify(result),
+  });
+}
 
 /**
  * Read the trial config file written by the backend.
@@ -154,8 +217,11 @@ export function activate(context: vscode.ExtensionContext) {
   // When task changes, clear chat history
   taskPanelProvider.onTaskChanged(() => {
     conversationHistory = [];
+    pendingToolCalls.clear();
+    chatState = 'idle';
     if (chatPanel) {
       chatPanel.webview.postMessage({ command: 'clearChat' });
+      setChatState('idle', chatPanel);
     }
   });
 
@@ -254,10 +320,13 @@ export function activate(context: vscode.ExtensionContext) {
         {
           enableScripts: true,
           retainContextWhenHidden: true,
+          localResourceRoots: [
+            vscode.Uri.joinPath(context.extensionUri, 'node_modules'),
+          ],
         }
       );
 
-      chatPanel.webview.html = getWebviewContent();
+      chatPanel.webview.html = getWebviewContent(chatPanel.webview, context.extensionUri);
 
       // Send initial file list
       chatPanel.webview.postMessage({
@@ -275,6 +344,7 @@ export function activate(context: vscode.ExtensionContext) {
               break;
             case 'clearHistory':
               conversationHistory = [];
+              resetPendingToolCalls(chatPanel);
               chatPanel?.webview.postMessage({ command: 'clearChat' });
               break;
             case 'selectFiles':
@@ -349,6 +419,17 @@ async function handleSendMessage(
   panel: vscode.WebviewPanel
 ) {
   try {
+    if (chatState !== 'idle' || hasPendingToolCalls()) {
+      panel.webview.postMessage({
+        command: 'addMessage',
+        role: 'system',
+        content: 'Please approve or reject the pending edit before sending another message.',
+      });
+      return;
+    }
+
+    setChatState('streaming', panel);
+
     let config = context.globalState.get<Config>('config');
 
     // Use settings-based defaults if not configured via command
@@ -362,6 +443,7 @@ async function handleSendMessage(
     }
 
     if (!config.apiKey) {
+      setChatState('idle', panel);
       panel.webview.postMessage({
         command: 'addMessage',
         role: 'error',
@@ -463,70 +545,88 @@ async function handleSendMessage(
 
     let assistantMessage = '';
     let toolCalls: any[] = [];
-    let currentToolCall: any = null;
+    let sseBuffer = '';
 
-    response.data.on('data', (chunk: Buffer) => {
-      const lines = chunk.toString().split('\n').filter(line => line.trim() !== '');
+    const processSseLine = (line: string) => {
+      const trimmed = line.trim();
+      if (!trimmed || trimmed.startsWith(':')) {
+        return;
+      }
+      if (!trimmed.startsWith('data: ')) {
+        return;
+      }
 
-      for (const line of lines) {
-        if (line.includes('[DONE]')) {
-          continue;
+      const payload = trimmed.slice(6).trim();
+      if (payload === '[DONE]') {
+        return;
+      }
+
+      try {
+        const data = JSON.parse(payload);
+        const delta = data.choices[0]?.delta;
+
+        // Handle regular content
+        if (delta?.content) {
+          assistantMessage += delta.content;
+          panel.webview.postMessage({
+            command: 'streamChunk',
+            content: delta.content,
+          });
         }
 
-        if (line.startsWith('data: ')) {
-          try {
-            const data = JSON.parse(line.slice(6));
-            const delta = data.choices[0]?.delta;
-
-            // Handle regular content
-            if (delta?.content) {
-              assistantMessage += delta.content;
-              panel.webview.postMessage({
-                command: 'streamChunk',
-                content: delta.content,
-              });
-            }
-
-            // Handle tool calls
-            if (delta?.tool_calls) {
-              for (const toolCallDelta of delta.tool_calls) {
-                if (toolCallDelta.index !== undefined) {
-                  if (!toolCalls[toolCallDelta.index]) {
-                    toolCalls[toolCallDelta.index] = {
-                      id: toolCallDelta.id || '',
-                      type: toolCallDelta.type || 'function',
-                      function: {
-                        name: toolCallDelta.function?.name || '',
-                        arguments: toolCallDelta.function?.arguments || ''
-                      }
-                    };
-                  } else {
-                    // Append to existing tool call
-                    if (toolCallDelta.id) {
-                      toolCalls[toolCallDelta.index].id = toolCallDelta.id;
-                    }
-                    if (toolCallDelta.type) {
-                      toolCalls[toolCallDelta.index].type = toolCallDelta.type;
-                    }
-                    if (toolCallDelta.function?.name) {
-                      toolCalls[toolCallDelta.index].function.name += toolCallDelta.function.name;
-                    }
-                    if (toolCallDelta.function?.arguments) {
-                      toolCalls[toolCallDelta.index].function.arguments += toolCallDelta.function.arguments;
-                    }
+        // Handle tool calls
+        if (delta?.tool_calls) {
+          for (const toolCallDelta of delta.tool_calls) {
+            if (toolCallDelta.index !== undefined) {
+              if (!toolCalls[toolCallDelta.index]) {
+                toolCalls[toolCallDelta.index] = {
+                  id: toolCallDelta.id || '',
+                  type: toolCallDelta.type || 'function',
+                  function: {
+                    name: toolCallDelta.function?.name || '',
+                    arguments: toolCallDelta.function?.arguments || ''
                   }
+                };
+              } else {
+                // Append to existing tool call
+                if (toolCallDelta.id) {
+                  toolCalls[toolCallDelta.index].id = toolCallDelta.id;
+                }
+                if (toolCallDelta.type) {
+                  toolCalls[toolCallDelta.index].type = toolCallDelta.type;
+                }
+                if (toolCallDelta.function?.name) {
+                  toolCalls[toolCallDelta.index].function.name += toolCallDelta.function.name;
+                }
+                if (toolCallDelta.function?.arguments) {
+                  toolCalls[toolCallDelta.index].function.arguments += toolCallDelta.function.arguments;
                 }
               }
             }
-          } catch (e) {
-            // Skip invalid JSON
           }
         }
+      } catch (e) {
+        console.error('Failed to parse SSE payload:', e, payload);
+      }
+    };
+
+    response.data.on('data', (chunk: Buffer) => {
+      sseBuffer += chunk.toString();
+      const lines = sseBuffer.split(/\r?\n/);
+      sseBuffer = lines.pop() || '';
+
+      for (const line of lines) {
+        processSseLine(line);
       }
     });
 
     await new Promise<void>((resolve, reject) => {
       response.data.on('end', () => {
+        if (sseBuffer.trim()) {
+          processSseLine(sseBuffer);
+          sseBuffer = '';
+        }
+
         console.log('Stream ended. Tool calls count:', toolCalls.length);
         console.log('Tool calls:', JSON.stringify(toolCalls, null, 2));
 
@@ -536,8 +636,15 @@ async function handleSendMessage(
           content: assistantMessage || null,
         };
 
-        if (toolCalls.length > 0) {
-          assistantHistoryMessage.tool_calls = toolCalls;
+        const completedToolCalls = toolCalls.filter(Boolean);
+        for (const toolCall of completedToolCalls) {
+          if (!toolCall.id) {
+            toolCall.id = `tool_${Date.now()}_${Math.random().toString(16).slice(2)}`;
+          }
+        }
+
+        if (completedToolCalls.length > 0) {
+          assistantHistoryMessage.tool_calls = completedToolCalls;
         }
 
         conversationHistory.push(assistantHistoryMessage);
@@ -549,24 +656,42 @@ async function handleSendMessage(
             tc.participant_id,
             'assistant',
             assistantMessage || '',
-            toolCalls.length > 0 ? toolCalls : undefined,
+            completedToolCalls.length > 0 ? completedToolCalls : undefined,
           );
         }
 
         panel.webview.postMessage({ command: 'endStreaming' });
 
         // If there are tool calls, show them for approval
-        if (toolCalls.length > 0) {
+        if (completedToolCalls.length > 0) {
+          setChatState('awaitingTool', panel);
+
           // Show visual indicator that tool calls are being prepared
           panel.webview.postMessage({
             command: 'addMessage',
             role: 'system',
-            content: '🔧 Preparing file edit...',
+            content: completedToolCalls.length === 1
+              ? 'Preparing proposed edit...'
+              : `Preparing ${completedToolCalls.length} proposed edits...`,
           });
 
-          for (const toolCall of toolCalls) {
+          for (const toolCall of completedToolCalls) {
+            const toolCallId = toolCall.id;
             try {
               console.log('Parsing tool call arguments:', toolCall.function.arguments);
+
+              if (toolCall.function.name !== 'edit_file') {
+                appendToolResult(toolCallId, {
+                  success: false,
+                  message: `Unsupported tool: ${toolCall.function.name}`,
+                });
+                panel.webview.postMessage({
+                  command: 'addMessage',
+                  role: 'error',
+                  content: `Unsupported tool requested: ${toolCall.function.name}`,
+                });
+                continue;
+              }
 
               // Try to repair common JSON issues
               let argsString = toolCall.function.arguments;
@@ -577,15 +702,25 @@ async function handleSendMessage(
 
               console.log('Repaired arguments:', argsString);
               const args = JSON.parse(argsString);
+              pendingToolCalls.set(toolCallId, {
+                id: toolCallId,
+                name: toolCall.function.name,
+                args,
+                status: 'pending',
+              });
               panel.webview.postMessage({
                 command: 'showToolCall',
-                toolCallId: toolCall.id,
+                toolCallId,
                 toolName: toolCall.function.name,
                 args: args,
               });
             } catch (parseError: any) {
               console.error('Failed to parse tool call arguments:', parseError.message);
               console.error('Arguments string:', toolCall.function.arguments);
+              appendToolResult(toolCallId, {
+                success: false,
+                message: `Failed to parse edit arguments: ${parseError.message}`,
+              });
               panel.webview.postMessage({
                 command: 'addMessage',
                 role: 'error',
@@ -593,6 +728,12 @@ async function handleSendMessage(
               });
             }
           }
+
+          if (!hasPendingToolCalls()) {
+            setChatState('idle', panel);
+          }
+        } else {
+          setChatState('idle', panel);
         }
 
         resolve();
@@ -604,6 +745,7 @@ async function handleSendMessage(
     });
   } catch (error: any) {
     panel.webview.postMessage({ command: 'hideTyping' });
+    setChatState('idle', panel);
     panel.webview.postMessage({
       command: 'addMessage',
       role: 'error',
@@ -612,14 +754,13 @@ async function handleSendMessage(
   }
 }
 
-async function handleApplyDiff(diffContent: string): Promise<void> {
-  // Extract file path from diff headers
+function extractDiffPath(diffContent: string): string {
   const lines = diffContent.split('\n');
   let filePath = '';
 
   for (const line of lines) {
     if (line.startsWith('--- ')) {
-      filePath = line.substring(4).replace(/^a\//, '').replace(/^b\//, '');
+      filePath = line.substring(4).trim().replace(/^a\//, '').replace(/^b\//, '');
       break;
     }
   }
@@ -627,38 +768,67 @@ async function handleApplyDiff(diffContent: string): Promise<void> {
   if (!filePath) {
     throw new Error('Could not determine file path from diff');
   }
+  if (filePath === '/dev/null') {
+    throw new Error('Creating new files is not supported by this editor');
+  }
+  return filePath;
+}
+
+function resolveWorkspaceFile(inputPath: string): { uri: vscode.Uri; fsPath: string; relativePath: string } {
+  const workspaceFolder = vscode.workspace.workspaceFolders?.[0];
+  if (!workspaceFolder) {
+    throw new Error('No workspace folder open');
+  }
+
+  const workspaceRoot = path.resolve(workspaceFolder.uri.fsPath);
+  let candidate = inputPath.trim().replace(/^a\//, '').replace(/^b\//, '');
 
   // Normalize path
-  let normalizedPath = filePath;
-
   // Handle missing leading slash (e.g., "Users/..." should be "/Users/...")
-  if (!normalizedPath.startsWith('/') && !normalizedPath.startsWith('.') &&
-      (normalizedPath.startsWith('Users/') || normalizedPath.startsWith('home/') ||
-       normalizedPath.includes(':/') || /^[A-Za-z]:[\\/]/.test(normalizedPath))) {
-    normalizedPath = '/' + normalizedPath;
+  if (!candidate.startsWith('/') && !candidate.startsWith('.') &&
+      (candidate.startsWith('Users/') || candidate.startsWith('home/') ||
+       candidate.includes(':/') || /^[A-Za-z]:[\\/]/.test(candidate))) {
+    candidate = '/' + candidate;
   }
 
   // Determine if path is absolute
-  const isAbsolute = normalizedPath.startsWith('/') || /^[A-Za-z]:[\\/]/.test(normalizedPath);
+  const isAbsolute = candidate.startsWith('/') || /^[A-Za-z]:[\\/]/.test(candidate);
+  const resolvedPath = path.resolve(isAbsolute ? candidate : path.join(workspaceRoot, candidate));
+  const relativePath = path.relative(workspaceRoot, resolvedPath);
 
-  let fileUri: vscode.Uri;
-  if (isAbsolute) {
-    fileUri = vscode.Uri.file(normalizedPath);
-  } else {
-    const workspaceFolder = vscode.workspace.workspaceFolders?.[0];
-    if (!workspaceFolder) {
-      throw new Error('No workspace folder open');
+  if (relativePath === '' || relativePath.startsWith('..') || path.isAbsolute(relativePath)) {
+    throw new Error(`Refusing to edit a file outside the workspace: ${inputPath}`);
+  }
+
+  return {
+    uri: vscode.Uri.file(resolvedPath),
+    fsPath: resolvedPath,
+    relativePath,
+  };
+}
+
+async function handleApplyDiff(args: any): Promise<string> {
+  const diffContent = String(args?.diff || '');
+  const requestedPath = String(args?.file_path || '');
+  const diffPath = extractDiffPath(diffContent);
+  const target = resolveWorkspaceFile(diffPath);
+
+  if (requestedPath) {
+    const requested = resolveWorkspaceFile(requestedPath);
+    if (requested.fsPath !== target.fsPath) {
+      throw new Error(
+        `Diff target (${target.relativePath}) does not match requested file (${requested.relativePath})`
+      );
     }
-    fileUri = vscode.Uri.joinPath(workspaceFolder.uri, normalizedPath);
   }
 
   // Read original content
   let originalContent: string;
   try {
-    const content = await vscode.workspace.fs.readFile(fileUri);
+    const content = await vscode.workspace.fs.readFile(target.uri);
     originalContent = Buffer.from(content).toString('utf8');
   } catch (error: any) {
-    throw new Error(`Failed to read file ${normalizedPath}: ${error.message}`);
+    throw new Error(`Failed to read file ${target.relativePath}: ${error.message}`);
   }
 
   // Apply patch using the reliable patch applier
@@ -671,12 +841,13 @@ async function handleApplyDiff(diffContent: string): Promise<void> {
   // Write new content
   try {
     await vscode.workspace.fs.writeFile(
-      fileUri,
+      target.uri,
       Buffer.from(result.newContent, 'utf8')
     );
-    vscode.window.showInformationMessage(`Applied changes to ${normalizedPath}`);
+    vscode.window.showInformationMessage(`Applied changes to ${target.relativePath}`);
+    return target.relativePath;
   } catch (error: any) {
-    throw new Error(`Failed to write file ${normalizedPath}: ${error.message}`);
+    throw new Error(`Failed to write file ${target.relativePath}: ${error.message}`);
   }
 }
 
@@ -687,17 +858,29 @@ async function handleApproveToolCall(
   context: vscode.ExtensionContext,
   panel: vscode.WebviewPanel
 ) {
+  const pending = pendingToolCalls.get(toolCallId);
+  if (!pending || pending.status !== 'pending') {
+    panel.webview.postMessage({
+      command: 'addMessage',
+      role: 'system',
+      content: 'That edit has already been resolved.',
+    });
+    return;
+  }
+
   try {
+    setChatState('applyingTool', panel);
     if (toolName === 'edit_file') {
       // Apply the diff
-      await handleApplyDiff(args.diff);
+      const editedFile = await handleApplyDiff(args);
 
       // Add tool response to conversation history with tool_call_id
-      conversationHistory.push({
-        role: 'tool',
-        tool_call_id: toolCallId,
-        content: JSON.stringify({ success: true, message: 'Changes applied successfully' }),
-      } as any);
+      appendToolResult(toolCallId, {
+        success: true,
+        message: 'Changes applied successfully',
+        file: editedFile,
+      });
+      resolvePendingToolCall(toolCallId, 'applied', panel);
 
       // Log tool approval to backend
       const tcApprove = readTrialConfig();
@@ -714,11 +897,27 @@ async function handleApproveToolCall(
       panel.webview.postMessage({
         command: 'addMessage',
         role: 'system',
-        content: '✓ Changes applied successfully',
+        content: `Changes applied successfully to ${editedFile}`,
+      });
+    } else {
+      appendToolResult(toolCallId, {
+        success: false,
+        message: `Unsupported tool: ${toolName}`,
+      });
+      resolvePendingToolCall(toolCallId, 'failed', panel);
+      panel.webview.postMessage({
+        command: 'addMessage',
+        role: 'error',
+        content: `Unsupported tool requested: ${toolName}`,
       });
     }
   } catch (error: any) {
     console.error('Failed to apply tool call:', error);
+    appendToolResult(toolCallId, {
+      success: false,
+      message: `Failed to apply changes: ${error.message}`,
+    });
+    resolvePendingToolCall(toolCallId, 'failed', panel);
     vscode.window.showErrorMessage(`Failed to apply tool call: ${error.message}`);
     panel.webview.postMessage({
       command: 'addMessage',
@@ -732,12 +931,22 @@ async function handleRejectToolCall(
   toolCallId: string,
   panel: vscode.WebviewPanel
 ) {
+  const pending = pendingToolCalls.get(toolCallId);
+  if (!pending || pending.status !== 'pending') {
+    panel.webview.postMessage({
+      command: 'addMessage',
+      role: 'system',
+      content: 'That edit has already been resolved.',
+    });
+    return;
+  }
+
   // Add rejection to conversation history with tool_call_id
-  conversationHistory.push({
-    role: 'tool',
-    tool_call_id: toolCallId,
-    content: JSON.stringify({ success: false, message: 'User rejected the proposed changes' }),
-  } as any);
+  appendToolResult(toolCallId, {
+    success: false,
+    message: 'User rejected the proposed changes',
+  });
+  resolvePendingToolCall(toolCallId, 'rejected', panel);
 
   // Log tool rejection to backend
   const tcReject = readTrialConfig();
@@ -755,13 +964,20 @@ async function handleRejectToolCall(
   });
 }
 
-function getWebviewContent(): string {
+function getWebviewContent(webview: vscode.Webview, extensionUri: vscode.Uri): string {
+  const markedUri = webview.asWebviewUri(
+    vscode.Uri.joinPath(extensionUri, 'node_modules', 'marked', 'lib', 'marked.umd.js')
+  );
+  const purifyUri = webview.asWebviewUri(
+    vscode.Uri.joinPath(extensionUri, 'node_modules', 'dompurify', 'dist', 'purify.min.js')
+  );
+  const cspSource = webview.cspSource;
   return `<!DOCTYPE html>
 <html>
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline';">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src ${cspSource} 'unsafe-inline';">
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
 
@@ -880,6 +1096,52 @@ function getWebviewContent(): string {
     code {
       font-family: var(--vscode-editor-font-family);
       font-size: 0.9em;
+    }
+
+    .markdown-body { white-space: normal; }
+    .markdown-body > *:first-child { margin-top: 0; }
+    .markdown-body > *:last-child { margin-bottom: 0; }
+    .markdown-body p { margin: 0 0 8px 0; }
+    .markdown-body h1,
+    .markdown-body h2,
+    .markdown-body h3,
+    .markdown-body h4,
+    .markdown-body h5,
+    .markdown-body h6 {
+      margin: 12px 0 6px 0;
+      font-weight: 600;
+      line-height: 1.3;
+    }
+    .markdown-body h1 { font-size: 1.4em; }
+    .markdown-body h2 { font-size: 1.25em; }
+    .markdown-body h3 { font-size: 1.1em; }
+    .markdown-body h4, .markdown-body h5, .markdown-body h6 { font-size: 1em; }
+    .markdown-body ul, .markdown-body ol { margin: 4px 0 8px 0; padding-left: 24px; }
+    .markdown-body li { margin: 2px 0; }
+    .markdown-body blockquote {
+      margin: 8px 0;
+      padding: 4px 12px;
+      border-left: 3px solid var(--vscode-panel-border);
+      color: var(--vscode-descriptionForeground);
+    }
+    .markdown-body a { color: var(--vscode-textLink-foreground); }
+    .markdown-body hr {
+      border: none;
+      border-top: 1px solid var(--vscode-panel-border);
+      margin: 12px 0;
+    }
+    .markdown-body code:not(pre code) {
+      background: var(--vscode-textCodeBlock-background);
+      padding: 1px 4px;
+      border-radius: 3px;
+    }
+    .markdown-body table {
+      border-collapse: collapse;
+      margin: 8px 0;
+    }
+    .markdown-body th, .markdown-body td {
+      border: 1px solid var(--vscode-panel-border);
+      padding: 4px 8px;
     }
 
     #input-area {
@@ -1024,6 +1286,8 @@ function getWebviewContent(): string {
     <button id="send-btn">Send</button>
   </div>
 
+  <script src="${markedUri}"></script>
+  <script src="${purifyUri}"></script>
   <script>
     const vscode = acquireVsCodeApi();
     const messages = document.getElementById('messages');
@@ -1033,6 +1297,7 @@ function getWebviewContent(): string {
     const selectFilesBtn = document.getElementById('select-files-btn');
     const clearFilesBtn = document.getElementById('clear-files-btn');
     const clearChatBtn = document.getElementById('clear-chat-btn');
+    let inputEnabled = true;
 
     input.addEventListener('input', function() {
       this.style.height = 'auto';
@@ -1067,6 +1332,7 @@ function getWebviewContent(): string {
 
     function send() {
       console.log('Send button clicked');
+      if (!inputEnabled) return;
       const text = input.value.trim();
       console.log('Message text:', text);
       if (!text) return;
@@ -1090,16 +1356,44 @@ function getWebviewContent(): string {
       vscode.postMessage({ command: 'clearFiles' });
     }
 
+    function setInputEnabled(enabled, reason) {
+      inputEnabled = enabled;
+      input.disabled = !enabled;
+      sendBtn.disabled = !enabled;
+      input.placeholder = enabled ? 'Type your message...' : (reason || 'Please wait...');
+    }
+
+    function escapeHtml(content) {
+      return String(content ?? '').replace(/[&<>"']/g, (c) =>
+        ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
+    }
+
+    function renderMarkdown(content) {
+      if (typeof marked === 'undefined' || typeof DOMPurify === 'undefined') {
+        const fallback = content.replace(
+          /\`\`\`([\\w]*)?\\n([\\s\\S]*?)\`\`\`/g,
+          '<pre><code>$2</code></pre>'
+        );
+        return fallback;
+      }
+      const rawHtml = marked.parse(content, { breaks: true, gfm: true });
+      return DOMPurify.sanitize(rawHtml);
+    }
+
     function addMessage(role, content) {
       const div = document.createElement('div');
       div.className = 'message ' + role;
 
-      const formatted = content.replace(
-        /\`\`\`([\\w]*)?\\n([\\s\\S]*?)\`\`\`/g,
-        '<pre><code>$2</code></pre>'
-      );
-
-      div.innerHTML = formatted;
+      if (role === 'assistant') {
+        div.classList.add('markdown-body');
+        div.innerHTML = renderMarkdown(content);
+      } else {
+        const formatted = escapeHtml(content).replace(
+          /\`\`\`([\\w]*)?\\n([\\s\\S]*?)\`\`\`/g,
+          '<pre><code>$2</code></pre>'
+        );
+        div.innerHTML = formatted;
+      }
       messages.appendChild(div);
       messages.scrollTop = messages.scrollHeight;
     }
@@ -1115,7 +1409,7 @@ function getWebviewContent(): string {
         fileContext.classList.add('visible');
         fileList.innerHTML = files.map(f => {
           const name = f.split('/').pop() || f;
-          return '<span class="file-badge">' + name + '</span>';
+          return '<span class="file-badge">' + escapeHtml(name) + '</span>';
         }).join('');
       }
     }
@@ -1142,14 +1436,8 @@ function getWebviewContent(): string {
     function endStreaming() {
       if (streamingMessage) {
         const content = streamingMessage.textContent;
-
-        // Format the content
-        const formatted = content.replace(
-          /\`\`\`([\\w]*)?\\n([\\s\\S]*?)\`\`\`/g,
-          '<pre><code>$2</code></pre>'
-        );
-
-        streamingMessage.innerHTML = formatted;
+        streamingMessage.classList.add('markdown-body');
+        streamingMessage.innerHTML = renderMarkdown(content);
         streamingMessage.id = '';
         streamingMessage = null;
       }
@@ -1163,9 +1451,9 @@ function getWebviewContent(): string {
       let content = '<div class="tool-call-header"><strong>🔧 Proposed Edit</strong></div>';
 
       if (toolName === 'edit_file') {
-        content += '<div class="tool-call-description">' + args.description + '</div>';
-        content += '<div class="tool-call-file">File: <code>' + args.file_path + '</code></div>';
-        content += '<div class="tool-call-diff"><pre><code>' + args.diff + '</code></pre></div>';
+        content += '<div class="tool-call-description">' + escapeHtml(args.description) + '</div>';
+        content += '<div class="tool-call-file">File: <code>' + escapeHtml(args.file_path) + '</code></div>';
+        content += '<div class="tool-call-diff"><pre><code>' + escapeHtml(args.diff) + '</code></pre></div>';
 
         content += '<div class="tool-call-actions">';
         content += '<button class="approve-btn" data-tool-call-id="' + toolCallId + '" data-tool-name="' + toolName + '" data-args="' + encodeURIComponent(JSON.stringify(args)) + '">✓ Approve</button>';
@@ -1242,6 +1530,9 @@ function getWebviewContent(): string {
           break;
         case 'showToolCall':
           showToolCall(msg.toolCallId, msg.toolName, msg.args);
+          break;
+        case 'setInputEnabled':
+          setInputEnabled(msg.enabled, msg.reason);
           break;
       }
     });

@@ -38,12 +38,21 @@ export class TaskPanelProvider implements vscode.WebviewViewProvider {
     this._configWatcher = vscode.workspace.createFileSystemWatcher('**/.trial_config.json');
     this._configWatcher.onDidChange(() => this._onConfigChanged());
     this._configWatcher.onDidCreate(() => this._onConfigChanged());
+    this._configWatcher.onDidDelete(() => this._onConfigDeleted());
   }
 
   private _onConfigChanged() {
     // Task was changed by the backend — refresh the panel
     if (this._view) {
       this._view.webview.postMessage({ command: 'refreshTask' });
+    }
+    this._onTaskChanged.fire();
+  }
+
+  private _onConfigDeleted() {
+    // The backend clears .trial_config.json when all tasks are complete.
+    if (this._view) {
+      this._view.webview.postMessage({ command: 'taskCompleted' });
     }
     this._onTaskChanged.fire();
   }
@@ -73,6 +82,9 @@ export class TaskPanelProvider implements vscode.WebviewViewProvider {
           break;
         case 'timeout':
           await this._handleTimeout();
+          break;
+        case 'openCompletionPage':
+          await this._handleOpenCompletionPage();
           break;
       }
     });
@@ -237,6 +249,14 @@ export class TaskPanelProvider implements vscode.WebviewViewProvider {
     }
   }
 
+  private async _handleOpenCompletionPage() {
+    const trialConfig = this._readTrialConfig();
+    if (!trialConfig?.participant_id) { return; }
+    const backendUrl = this._getBackendUrl();
+    const url = `${backendUrl}/study/complete/${trialConfig.participant_id}`;
+    await vscode.env.openExternal(vscode.Uri.parse(url));
+  }
+
   dispose() {
     this._configWatcher?.dispose();
   }
@@ -372,6 +392,19 @@ export class TaskPanelProvider implements vscode.WebviewViewProvider {
       margin-top: 20px;
     }
     .completed-msg h2 { font-size: 16px; margin-bottom: 8px; }
+    .completed-msg p { margin-bottom: 12px; }
+    .btn-continue {
+      margin-top: 12px;
+      padding: 10px 18px;
+      background: var(--vscode-button-background);
+      color: var(--vscode-button-foreground);
+      border: none;
+      border-radius: 4px;
+      font-size: 13px;
+      font-weight: 600;
+      cursor: pointer;
+    }
+    .btn-continue:hover { background: var(--vscode-button-hoverBackground); }
   </style>
 </head>
 <body>
@@ -398,6 +431,8 @@ export class TaskPanelProvider implements vscode.WebviewViewProvider {
   <div id="completed" class="completed-msg" style="display:none;">
     <h2>All Tasks Complete</h2>
     <p>Thank you for participating in this study!</p>
+    <p>Please continue to the final questionnaire to complete your participation.</p>
+    <button class="btn-continue" id="btn-continue">Continue to Questionnaire</button>
   </div>
 
   <script>
@@ -424,6 +459,10 @@ export class TaskPanelProvider implements vscode.WebviewViewProvider {
       document.getElementById('btn-submit').disabled = true;
       document.getElementById('btn-submit').textContent = 'Submitting...';
       vscode.postMessage({ command: 'submitCode' });
+    });
+
+    document.getElementById('btn-continue').addEventListener('click', () => {
+      vscode.postMessage({ command: 'openCompletionPage' });
     });
 
     function startTimer(seconds) {
@@ -535,6 +574,13 @@ export class TaskPanelProvider implements vscode.WebviewViewProvider {
           // Task was changed by backend — reload
           document.getElementById('results-area').innerHTML = '';
           vscode.postMessage({ command: 'loadTask' });
+          break;
+
+        case 'taskCompleted':
+          document.getElementById('loading').style.display = 'none';
+          document.getElementById('task-content').style.display = 'none';
+          document.getElementById('completed').style.display = 'block';
+          if (timerInterval) clearInterval(timerInterval);
           break;
       }
     });
