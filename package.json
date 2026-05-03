@@ -1,7 +1,7 @@
 {
   "name": "simple-chat-extension",
-  "displayName": "Simple Chat",
-  "description": "Simple OpenRouter chat with git diff support",
+  "displayName": "Human Study Chat Assistant",
+  "description": "Human study chat assistant with git diff support",
   "version": "0.1.0",
   "engines": {
     "vscode": "^1.85.0"
@@ -23,7 +23,7 @@
       "activitybar": [
         {
           "id": "simpleChat",
-          "title": "Simple Chat",
+          "title": "Human Study Chat Assistant",
           "icon": "$(comment-discussion)"
         }
       ]
@@ -44,29 +44,29 @@
     "commands": [
       {
         "command": "simpleChat.openChat",
-        "title": "Open Chat",
-        "category": "Simple Chat",
+        "title": "Open Human Study Chat Assistant",
+        "category": "Human Study Chat Assistant",
         "icon": "$(add)"
       },
       {
         "command": "simpleChat.configure",
         "title": "Configure OpenRouter",
-        "category": "Simple Chat"
+        "category": "Human Study Chat Assistant"
       },
       {
         "command": "simpleChat.selectFiles",
         "title": "Select Files for Context",
-        "category": "Simple Chat"
+        "category": "Human Study Chat Assistant"
       },
       {
         "command": "simpleChat.clearFiles",
         "title": "Clear File Context",
-        "category": "Simple Chat"
+        "category": "Human Study Chat Assistant"
       }
     ],
     "configuration": {
       "type": "object",
-      "title": "Simple Chat",
+      "title": "Human Study Chat Assistant",
       "properties": {
         "simple-chat.backendUrl": {
           "type": "string",

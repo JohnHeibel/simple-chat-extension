@@ -1,4 +1,4 @@
-// Simple Chat Extension - VS Code chat interface with AI assistance and code diff application
+// Human Study Chat Assistant - VS Code chat interface with AI assistance and code diff application
 // Integrates with OpenRouter API for streaming chat responses
 // Modified for automated human trial platform — fetches prompts from backend, logs all messages
 
@@ -192,10 +192,10 @@ class ChatViewProvider implements vscode.TreeDataProvider<vscode.TreeItem> {
 
   getChildren(element?: vscode.TreeItem): Thenable<vscode.TreeItem[]> {
     if (!element) {
-      const item = new vscode.TreeItem('New Chat', vscode.TreeItemCollapsibleState.None);
+      const item = new vscode.TreeItem('New Assistant Chat', vscode.TreeItemCollapsibleState.None);
       item.command = {
         command: 'simpleChat.openChat',
-        title: 'Open Chat'
+        title: 'Open Human Study Chat Assistant'
       };
       return Promise.resolve([item]);
     }
@@ -315,7 +315,7 @@ export function activate(context: vscode.ExtensionContext) {
 
       chatPanel = vscode.window.createWebviewPanel(
         'simpleChat',
-        'Chat',
+        'Human Study Chat Assistant',
         vscode.ViewColumn.Beside,
         {
           enableScripts: true,
@@ -1261,7 +1261,7 @@ function getWebviewContent(webview: vscode.Webview, extensionUri: vscode.Uri): s
 </head>
 <body>
   <div id="toolbar">
-    <h2>Chat</h2>
+    <h2>Human Study Chat Assistant</h2>
     <div class="toolbar-buttons">
       <button class="clear-btn" id="select-files-btn">+ Files</button>
       <button class="clear-btn" id="clear-files-btn">Clear Files</button>

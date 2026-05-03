@@ -243,7 +243,7 @@ export class TaskPanelProvider implements vscode.WebviewViewProvider {
         `${backendUrl}/api/tasks/timeout/${trialConfig.participant_id}`
       );
       this._onTaskChanged.fire();
-      vscode.window.showWarningMessage('Time is up! Moving to next task...');
+      vscode.window.showWarningMessage('Time is up! The study is complete.');
     } catch (error: any) {
       console.error('Timeout handler error:', error);
     }
