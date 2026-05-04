@@ -51,6 +51,8 @@ let chatPanel;
 let conversationHistory = [];
 let selectedFiles = [];
 let cachedTrialConfig = null;
+let studyStartPromise;
+let instructionsOpened = false;
 let chatState = 'idle';
 let pendingToolCalls = new Map();
 function hasPendingToolCalls() {
@@ -95,25 +97,40 @@ function appendToolResult(toolCallId, result) {
     });
 }
 /**
- * Read the trial config file written by the backend.
+ * Read a JSON metadata file from the workspace root.
  */
-function readTrialConfig() {
+function readWorkspaceJson(fileName) {
     try {
         const workspaceFolders = vscode.workspace.workspaceFolders;
         if (!workspaceFolders || workspaceFolders.length === 0) {
             return null;
         }
-        const configPath = path.join(workspaceFolders[0].uri.fsPath, '.trial_config.json');
+        const configPath = path.join(workspaceFolders[0].uri.fsPath, fileName);
         if (!fs.existsSync(configPath)) {
             return null;
         }
         const data = fs.readFileSync(configPath, 'utf-8');
-        cachedTrialConfig = JSON.parse(data);
-        return cachedTrialConfig;
+        return JSON.parse(data);
     }
     catch {
         return null;
     }
+}
+/**
+ * Read the trial config file written by the backend after the study starts.
+ */
+function readTrialConfig() {
+    const config = readWorkspaceJson('.trial_config.json');
+    if (config) {
+        cachedTrialConfig = config;
+    }
+    return config;
+}
+/**
+ * Read the pre-study registration metadata written before task files exist.
+ */
+function readTrialRegistration() {
+    return readWorkspaceJson('.trial_registration.json');
 }
 /**
  * Get the backend URL from VS Code settings.
@@ -121,6 +138,55 @@ function readTrialConfig() {
 function getBackendUrl() {
     const config = vscode.workspace.getConfiguration('simple-chat');
     return config.get('backendUrl') || 'https://code.johnheibel.com';
+}
+async function ensureStudyStarted() {
+    if (readTrialConfig()?.participant_id) {
+        return;
+    }
+    const registration = readTrialRegistration();
+    if (!registration?.participant_id) {
+        return;
+    }
+    if (studyStartPromise) {
+        return studyStartPromise;
+    }
+    studyStartPromise = (async () => {
+        if (readTrialConfig()?.participant_id) {
+            return;
+        }
+        const backendUrl = registration.backend_url || getBackendUrl();
+        try {
+            await axios_1.default.post(`${backendUrl}/api/study/start/${registration.participant_id}`);
+            readTrialConfig();
+        }
+        catch (error) {
+            const detail = error.response?.data?.detail || error.message || 'unknown error';
+            vscode.window.showErrorMessage(`Failed to start study: ${detail}`);
+        }
+        finally {
+            studyStartPromise = undefined;
+        }
+    })();
+    return studyStartPromise;
+}
+async function openInstructionsReadme() {
+    if (instructionsOpened) {
+        return;
+    }
+    const workspaceFolders = vscode.workspace.workspaceFolders;
+    if (!workspaceFolders || workspaceFolders.length === 0) {
+        return;
+    }
+    const readmePath = path.join(workspaceFolders[0].uri.fsPath, 'README.md');
+    if (!fs.existsSync(readmePath)) {
+        return;
+    }
+    instructionsOpened = true;
+    const doc = await vscode.workspace.openTextDocument(vscode.Uri.file(readmePath));
+    await vscode.window.showTextDocument(doc, {
+        viewColumn: vscode.ViewColumn.One,
+        preview: false,
+    });
 }
 /**
  * Log a chat message to the backend (fire-and-forget).
@@ -260,9 +326,10 @@ function activate(context) {
         }
     });
     // Register open chat command
-    const openChatCommand = vscode.commands.registerCommand('simpleChat.openChat', () => {
+    const openChatCommand = vscode.commands.registerCommand('simpleChat.openChat', async () => {
         if (chatPanel) {
             chatPanel.reveal();
+            await ensureStudyStarted();
             return;
         }
         chatPanel = vscode.window.createWebviewPanel('simpleChat', 'Human Study Chat Assistant', vscode.ViewColumn.Beside, {
@@ -333,9 +400,13 @@ function activate(context) {
         chatPanel.onDidDispose(() => {
             chatPanel = undefined;
         });
+        await ensureStudyStarted();
     });
     context.subscriptions.push(configureCommand, selectFilesCommand, clearFilesCommand, openChatCommand);
-    vscode.commands.executeCommand('simpleChat.openChat');
+    void (async () => {
+        await openInstructionsReadme();
+        await vscode.commands.executeCommand('simpleChat.openChat');
+    })();
 }
 async function handleSendMessage(userMessage, context, panel) {
     try {

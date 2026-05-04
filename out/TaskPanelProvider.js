@@ -108,6 +108,22 @@ class TaskPanelProvider {
             return null;
         }
     }
+    _readTrialRegistration() {
+        try {
+            const workspaceFolders = vscode.workspace.workspaceFolders;
+            if (!workspaceFolders) {
+                return null;
+            }
+            const configPath = path.join(workspaceFolders[0].uri.fsPath, '.trial_registration.json');
+            if (!fs.existsSync(configPath)) {
+                return null;
+            }
+            return JSON.parse(fs.readFileSync(configPath, 'utf-8'));
+        }
+        catch {
+            return null;
+        }
+    }
     _getBackendUrl() {
         const config = vscode.workspace.getConfiguration('simple-chat');
         return config.get('backendUrl') || 'https://code.johnheibel.com';
@@ -241,11 +257,12 @@ class TaskPanelProvider {
     }
     async _handleOpenCompletionPage() {
         const trialConfig = this._readTrialConfig();
-        if (!trialConfig?.participant_id) {
+        const participantId = trialConfig?.participant_id || this._readTrialRegistration()?.participant_id;
+        if (!participantId) {
             return;
         }
         const backendUrl = this._getBackendUrl();
-        const url = `${backendUrl}/study/complete/${trialConfig.participant_id}`;
+        const url = `${backendUrl}/study/complete/${participantId}`;
         await vscode.env.openExternal(vscode.Uri.parse(url));
     }
     dispose() {
